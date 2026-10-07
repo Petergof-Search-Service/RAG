@@ -7,14 +7,34 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, cast
 
-from config import RAG_BUCKET_NAME, RAG_S3_ENDPOINT_URL, RAG_MAX_CHUNK_LEN, RAG_YANDEX_API_KEY, RAG_ACCESS_KEY, RAG_YANDEX_FOLDER_ID, RAG_SECRET_KEY, RAG_CHUNKS_PATH
+from config import RAG_BUCKET_NAME, RAG_S3_ENDPOINT_URL, RAG_MAX_CHUNK_LEN, RAG_YANDEX_API_KEY, RAG_ACCESS_KEY, RAG_YANDEX_FOLDER_ID, RAG_SECRET_KEY, RAG_CHUNKS_PATH, API_BASE_URL, CLOUD_FUNCTION_API_KEY
 
 import boto3
-import openai
+import requests
 from openai import AsyncOpenAI
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
+
+
+def _patch_status(key: str, status: str, error: str | None = None) -> None:
+    if not API_BASE_URL or not CLOUD_FUNCTION_API_KEY:
+        print("_patch_status: API_BASE_URL or CLOUD_FUNCTION_API_KEY is not configured, skipping")
+        return
+    url = f"{API_BASE_URL}/files/by-key/status"
+    try:
+        resp = requests.patch(
+            url,
+            json={"system_key": key, "status": status, "error_message": error},
+            headers={"x-service-key": CLOUD_FUNCTION_API_KEY},
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code} body={resp.text[:300]}")
+        else:
+            print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"_patch_status error: {e}")
 
 
 def make_s3_client() -> S3Client:
@@ -219,7 +239,6 @@ async def upload_chunks_jsonl_bytes(
     client: AsyncOpenAI,
     jsonl_data: bytes,
     upload_name: str,
-    expires_seconds: int = 3600,
 ) -> str:
     print(f"[DEBUG UPLOAD] Начинаю загрузку файла: {upload_name}")
     print(f"[DEBUG UPLOAD] Размер данных: {len(jsonl_data)} байт")
@@ -229,10 +248,6 @@ async def upload_chunks_jsonl_bytes(
     f = await client.files.create(
         file=(upload_name, bio, "application/jsonlines"),
         purpose="assistants",
-        expires_after=openai.types.file_create_params.ExpiresAfter(
-            anchor="created_at",
-            seconds=expires_seconds,
-        ),
         extra_body={"format": "chunks"},
     )
     return cast(str, f.id)
@@ -246,20 +261,27 @@ async def _process_one_file(
     overlap_chars: int,
 ) -> Dict[str, Any]:
     print(f"PROCESSING: {s3_key}")
+    await asyncio.to_thread(_patch_status, s3_key, "rag_indexing")
 
-    raw = await s3_get_bytes(s3_client, s3_key)
-    pages = parse_pages_from_bytes(raw, s3_key)
+    try:
+        raw = await s3_get_bytes(s3_client, s3_key)
+        pages = parse_pages_from_bytes(raw, s3_key)
 
-    marked = build_marked_text(pages)
-    chunks = chunk_text_window_overlap(marked, window_chars, overlap_chars)
-    jsonl_data = chunks_to_jsonl_bytes(chunks)
+        marked = build_marked_text(pages)
+        chunks = chunk_text_window_overlap(marked, window_chars, overlap_chars)
+        jsonl_data = chunks_to_jsonl_bytes(chunks)
 
-    upload_name = make_upload_name(s3_key)
-    file_id = await upload_chunks_jsonl_bytes(client, jsonl_data, upload_name)
+        upload_name = make_upload_name(s3_key)
+        file_id = await upload_chunks_jsonl_bytes(client, jsonl_data, upload_name)
 
-    print(f"OK: {s3_key} -> chunks={len(chunks)} -> file_id={file_id}")
+        print(f"OK: {s3_key} -> chunks={len(chunks)} -> file_id={file_id}")
 
-    await s3_delete_key(s3_client, s3_key)
+        await s3_delete_key(s3_client, s3_key)
+    except Exception as exc:
+        await asyncio.to_thread(_patch_status, s3_key, "failed", str(exc))
+        raise
+
+    await asyncio.to_thread(_patch_status, s3_key, "indexed")
 
     return {
         "s3_key": s3_key,

@@ -21,6 +21,10 @@ RAG_ACCESS_KEY = os.getenv("RAG_ACCESS_KEY")
 RAG_YANDEX_FOLDER_ID = os.getenv("RAG_YANDEX_FOLDER_ID")
 RAG_SECRET_KEY = os.getenv("RAG_SECRET_KEY")
 RAG_CHUNKS_PATH = os.getenv("RAG_CHUNKS_PATH")
+# Куда складывать готовый chunks.jsonl как durable-источник для пересборки индекса
+# (API пересоздаёт из него файл в AI Studio по требованию). Должен отличаться от
+# RAG_CHUNKS_PATH, иначе артефакты попадут во вход функции на след. запуске.
+RAG_CHUNKS_STORE_PATH = os.getenv("RAG_CHUNKS_STORE_PATH", "data/chunks")
 
 API_BASE_URL = os.getenv("API_BASE_URL", "")
 CLOUD_FUNCTION_API_KEY = os.getenv("CLOUD_FUNCTION_API_KEY", "")

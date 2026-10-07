@@ -7,7 +7,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, cast
 
-from config import RAG_BUCKET_NAME, RAG_S3_ENDPOINT_URL, RAG_MAX_CHUNK_LEN, RAG_YANDEX_API_KEY, RAG_ACCESS_KEY, RAG_YANDEX_FOLDER_ID, RAG_SECRET_KEY, RAG_CHUNKS_PATH, API_BASE_URL, CLOUD_FUNCTION_API_KEY
+from config import RAG_BUCKET_NAME, RAG_S3_ENDPOINT_URL, RAG_MAX_CHUNK_LEN, RAG_YANDEX_API_KEY, RAG_ACCESS_KEY, RAG_YANDEX_FOLDER_ID, RAG_SECRET_KEY, RAG_CHUNKS_PATH, RAG_CHUNKS_STORE_PATH, API_BASE_URL, CLOUD_FUNCTION_API_KEY
 
 import boto3
 import requests
@@ -54,7 +54,9 @@ async def s3_list_keys(s3_client: S3Client) -> List[str]:
         for page in paginator.paginate(Bucket=RAG_BUCKET_NAME, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key == prefix:
+                # Пропускаем сам префикс и durable-артефакты chunks.jsonl (их кладёт
+                # сюда s3_put_bytes) — иначе функция переобработает свой же выход.
+                if key == prefix or key.endswith(".chunks.jsonl"):
                     continue
                 keys.append(key)
         return keys
@@ -76,6 +78,14 @@ async def s3_delete_key(s3_client: S3Client, key: str) -> None:
 
     await asyncio.to_thread(_sync)
     print(f"DELETED: {key}")
+
+
+async def s3_put_bytes(s3_client: S3Client, key: str, data: bytes) -> None:
+    def _sync() -> None:
+        s3_client.put_object(Bucket=RAG_BUCKET_NAME, Key=key, Body=data)
+
+    await asyncio.to_thread(_sync)
+    print(f"STORED: {key}")
 
 
 def parse_pages_from_bytes(data: bytes, key: str) -> List[Dict[str, Any]]:
@@ -276,6 +286,12 @@ async def _process_one_file(
 
         print(f"OK: {s3_key} -> chunks={len(chunks)} -> file_id={file_id}")
 
+        # Durable-источник: кладём готовый chunks.jsonl в отдельный префикс, чтобы
+        # API мог пересоздать файл в AI Studio по требованию (файлы там истекают).
+        store_key = f"{RAG_CHUNKS_STORE_PATH.rstrip('/')}/{upload_name}"
+        await s3_put_bytes(s3_client, store_key, jsonl_data)
+
+        # Вход (OCR-json) потребляем, чтобы не переобработать на след. запуске.
         await s3_delete_key(s3_client, s3_key)
     except Exception as exc:
         await asyncio.to_thread(_patch_status, s3_key, "failed", str(exc))
